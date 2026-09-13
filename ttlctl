@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""ttlctl - user-facing client for tooktoolongd.
+
+Create wall/command timers and stopwatches, check on them, list them, and
+delete them. Talks to the root daemon over a world-writable UNIX socket;
+the daemon authenticates you by your real uid (SO_PEERCRED), not anything
+this program sends, so you can only ever manage your own timers unless
+you're root.
+"""
+import argparse
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import ttlcommon as common
+
+
+def call(action, body=None, timeout=10.0):
+    try:
+        resp = common.request({"action": action, "body": body or {}}, timeout=timeout)
+    except (ConnectionError, common.ProtocolError, OSError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not resp.get("ok"):
+        print(f"error: {resp.get('error', 'unknown error')}", file=sys.stderr)
+        sys.exit(1)
+    return resp
+
+
+def cmd_create(args, kind, extra_body):
+    body = {
+        "kind": kind,
+        "name": args.name,
+        "message": args.message,
+        "catch_up": args.catch_up,
+    }
+    if kind != "stopwatch":
+        body["duration"] = args.duration
+    body.update(extra_body)
+    resp = call("create", body)
+    tid = resp["id"]
+    if kind == "stopwatch":
+        print(f"started stopwatch {tid}")
+    else:
+        print(f"created {kind} timer {tid}, fires in {common.format_duration(common.parse_duration(args.duration))}")
+
+
+def do_wall_group(args):
+    cmd_create(args, "wall_group", {})
+
+
+def do_cmd(args):
+    if args.shell:
+        command = " ".join(args.command)
+    else:
+        command = args.command
+    cmd_create(args, "cmd", {"command": command, "shell": args.shell})
+
+
+def do_stopwatch_start(args):
+    class A:
+        pass
+    a = A()
+    a.name = args.name
+    a.message = None
+    a.catch_up = False
+    cmd_create(a, "stopwatch", {})
+
+
+def timer_row(t):
+    tid = t["id"]
+    kind = t["kind"]
+    name = t.get("name") or "-"
+    owner = t["owner_user"]
+    if kind == "stopwatch":
+        when = f"elapsed {common.format_duration(t['elapsed'])}"
+    else:
+        remaining = t["remaining"]
+        when = (f"{common.format_duration(remaining)} left" if remaining > 0
+                else f"overdue by {common.format_duration(-remaining)}")
+    detail = ""
+    if kind == "wall_group":
+        detail = f"group={t.get('target_group')}"
+    elif kind == "cmd":
+        c = t.get("command")
+        detail = c if isinstance(c, str) else " ".join(c)
+    return f"{tid}  {kind:<12} {owner:<10} {name:<15} {when:<20} {detail}"
+
+
+def do_list(args):
+    resp = call("list", {"all": args.all})
+    timers = resp["timers"]
+    timers.sort(key=lambda t: t.get("expires_at", t.get("started_at", 0)))
+    if not timers:
+        print("no timers")
+        return
+    print(f"{'ID':<32}  {'KIND':<12} {'OWNER':<10} {'NAME':<15} {'STATUS':<20} DETAIL")
+    for t in timers:
+        print(timer_row(t))
+
+
+def do_status(args):
+    resp = call("status", {"id": args.id})
+    t = resp["timer"]
+    print(timer_row(t))
+
+
+def do_delete(args):
+    call("delete", {"id": args.id})
+    print(f"deleted {args.id}")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="ttlctl", description="control tooktoolongd timers/stopwatches")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    timer = sub.add_parser("timer", help="create a timer")
+    timer_sub = timer.add_subparsers(dest="timer_kind", required=True)
+
+    def add_common_timer_args(sp):
+        sp.add_argument("duration", help="e.g. 30s, 5m, 1h30m, 2d")
+        sp.add_argument("--name", help="friendly name")
+        sp.add_argument("--message", help="custom wall message (wall timers)")
+        sp.add_argument("--catch-up", action="store_true",
+                         help="if the daemon was down when this expires, run it on next startup instead of discarding it")
+
+    wg = timer_sub.add_parser("wall-group", help="wall your own group when time's up")
+    add_common_timer_args(wg)
+    wg.set_defaults(func=do_wall_group)
+
+    c = timer_sub.add_parser("cmd", help="run a command (as you) when time's up")
+    add_common_timer_args(c)
+    c.add_argument("--shell", action="store_true", help="run via /bin/sh -c instead of exec'ing argv directly")
+    c.set_defaults(func=do_cmd, timer_kind_is_cmd=True)
+
+    sw = sub.add_parser("stopwatch", help="stopwatch operations")
+    sw_sub = sw.add_subparsers(dest="stopwatch_action", required=True)
+    sws = sw_sub.add_parser("start", help="start a stopwatch")
+    sws.add_argument("--name", help="friendly name")
+    sws.set_defaults(func=do_stopwatch_start)
+    swd = sw_sub.add_parser("stop", help="stop (delete) a stopwatch")
+    swd.add_argument("id")
+    swd.set_defaults(func=do_delete)
+
+    ls = sub.add_parser("list", help="list your timers/stopwatches")
+    ls.add_argument("--all", action="store_true", help="list everyone's (root only)")
+    ls.set_defaults(func=do_list)
+
+    st = sub.add_parser("status", help="show time left/elapsed for one item")
+    st.add_argument("id")
+    st.set_defaults(func=do_status)
+
+    for name in ("delete", "rm", "cancel"):
+        d = sub.add_parser(name, help="delete a timer/stopwatch")
+        d.add_argument("id")
+        d.set_defaults(func=do_delete)
+
+    return p
+
+
+def main():
+    parser = build_parser()
+    argv = sys.argv[1:]
+
+    # `timer cmd` takes an arbitrary trailing command; split it off *before*
+    # argparse sees it so flags like --name aren't swallowed by it.
+    tail = None
+    if "--" in argv:
+        idx = argv.index("--")
+        tail = argv[idx + 1:]
+        argv = argv[:idx]
+
+    args = parser.parse_args(argv)
+
+    if getattr(args, "timer_kind_is_cmd", False):
+        if not tail:
+            parser.error("timer cmd requires a command after '--', e.g. `ttlctl timer cmd 5m -- echo hi`")
+        args.command = tail
+
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""tooktoolongd - root daemon backing ttlctl.
+
+Listens on a world-writable UNIX socket. Any local user can connect, but
+every request is authorized against the connecting process's *real* uid/gid
+(SO_PEERCRED), never anything the client claims in the request body - so
+ordinary users can only ever touch their own timers.
+
+Timer/stopwatch state is persisted under /var/lib/tooktoolong/timers as
+root-only (0600) JSON files, one per item, so it survives a daemon restart.
+"""
+import grp
+import json
+import os
+import pwd
+import signal
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import ttlcommon as common
+
+LOCK = threading.RLock()
+TIMERS = {}  # id -> dict
+
+
+def log(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# persistence
+# --------------------------------------------------------------------------
+
+def timer_path(tid):
+    return os.path.join(common.DATA_DIR, f"{tid}.json")
+
+
+def save_timer(t):
+    common.atomic_write_json(timer_path(t["id"]), t, mode=0o600)
+
+
+def delete_timer_file(tid):
+    try:
+        os.unlink(timer_path(tid))
+    except FileNotFoundError:
+        pass
+
+
+def ensure_dirs():
+    os.makedirs(common.RUN_DIR, exist_ok=True)
+    os.chmod(common.RUN_DIR, 0o755)
+    os.makedirs(common.DATA_DIR, exist_ok=True)
+    os.chmod(common.DATA_DIR, 0o700)
+
+
+def load_timers():
+    loaded = []
+    if not os.path.isdir(common.DATA_DIR):
+        return loaded
+    for name in os.listdir(common.DATA_DIR):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(common.DATA_DIR, name)
+        try:
+            with open(path) as f:
+                t = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            log(f"skipping unreadable timer file {path}: {e}")
+            continue
+        loaded.append(t)
+    return loaded
+
+
+def startup_reconcile():
+    """Load persisted timers; run-or-drop anything that expired while we
+    were down, per each timer's own catch_up flag."""
+    for t in load_timers():
+        tid = t["id"]
+        if t["kind"] == "stopwatch":
+            TIMERS[tid] = t
+            continue
+        if t["expires_at"] <= common.now():
+            if t.get("catch_up"):
+                log(f"timer {tid} ({t['kind']}) expired while daemon was down; "
+                    f"catch_up set, running now")
+                fire_timer(t)
+            else:
+                log(f"timer {tid} ({t['kind']}) expired while daemon was down; "
+                    f"catch_up not set, dropping")
+            delete_timer_file(tid)
+        else:
+            TIMERS[tid] = t
+            log(f"reloaded timer {tid} ({t['kind']}), "
+                f"{common.format_duration(t['expires_at'] - common.now())} left")
+
+
+# --------------------------------------------------------------------------
+# wall broadcasting
+# --------------------------------------------------------------------------
+
+def do_wall_group(sender, group, message):
+    try:
+        subprocess.run(["wall", "-g", group], input=message, text=True, timeout=5)
+    except Exception as e:
+        log(f"wall -g {group} failed: {e}")
+
+
+# --------------------------------------------------------------------------
+# firing timers
+# --------------------------------------------------------------------------
+
+def drop_privileges(uid, gid, home):
+    def preexec():
+        try:
+            username = pwd.getpwuid(uid).pw_name
+            os.initgroups(username, gid)
+        except (KeyError, OSError):
+            os.setgroups([gid])
+        os.setresgid(gid, gid, gid)
+        os.setresuid(uid, uid, uid)
+        os.chdir(home)
+        os.environ["HOME"] = home
+    return preexec
+
+
+def run_cmd_timer(t):
+    uid = t["owner_uid"]
+    try:
+        pw = pwd.getpwuid(uid)
+    except KeyError:
+        log(f"timer {t['id']}: owner uid {uid} no longer exists, skipping cmd")
+        return
+    home = pw.pw_dir if os.path.isdir(pw.pw_dir) else "/"
+    env = {
+        "HOME": home,
+        "USER": pw.pw_name,
+        "LOGNAME": pw.pw_name,
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "SHELL": pw.pw_shell or "/bin/sh",
+    }
+    if t.get("shell"):
+        args = ["/bin/sh", "-c", t["command"]]
+    else:
+        args = t["command"]
+    try:
+        subprocess.Popen(
+            args,
+            preexec_fn=drop_privileges(uid, pw.pw_gid, home),
+            env=env,
+            cwd=home,
+            stdin=subprocess.DEVNULL,
+        )
+        log(f"timer {t['id']}: ran command as {pw.pw_name}: {args!r}")
+    except Exception as e:
+        log(f"timer {t['id']}: failed to run command: {e}")
+
+
+def default_message(t):
+    label = t.get("name") or t["id"][:8]
+    return t.get("message") or (
+        f"Timer '{label}' set by {t['owner_user']} "
+        f"({common.format_duration(t['duration'])}) has expired!"
+    )
+
+
+def fire_timer(t):
+    kind = t["kind"]
+    sender = t["owner_user"]
+    message = default_message(t)
+    if kind == "wall_group":
+        do_wall_group(sender, t["target_group"], message)
+    elif kind == "cmd":
+        run_cmd_timer(t)
+    else:
+        log(f"timer {t['id']}: unknown kind {kind!r}, dropping")
+
+
+# --------------------------------------------------------------------------
+# scheduler
+# --------------------------------------------------------------------------
+
+def scheduler_loop(stop_event):
+    while not stop_event.is_set():
+        due = []
+        with LOCK:
+            for tid, t in list(TIMERS.items()):
+                if t["kind"] == "stopwatch":
+                    continue
+                if t["expires_at"] <= common.now():
+                    due.append(t)
+                    del TIMERS[tid]
+        for t in due:
+            log(f"timer {t['id']} ({t['kind']}) fired")
+            fire_timer(t)
+            delete_timer_file(t["id"])
+        stop_event.wait(1.0)
+
+
+# --------------------------------------------------------------------------
+# request handling
+# --------------------------------------------------------------------------
+
+def handle_create(uid, gid, body):
+    kind = body.get("kind")
+    if kind not in common.KINDS:
+        return {"ok": False, "error": f"unknown kind {kind!r}"}
+    try:
+        owner_user = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return {"ok": False, "error": "cannot resolve your uid to a username"}
+
+    tid = uuid.uuid4().hex
+    t = {
+        "id": tid,
+        "kind": kind,
+        "owner_uid": uid,
+        "owner_user": owner_user,
+        "name": body.get("name"),
+        "message": body.get("message"),
+        "created_at": common.now(),
+        "catch_up": bool(body.get("catch_up", False)),
+    }
+
+    if kind == "stopwatch":
+        t["started_at"] = common.now()
+        with LOCK:
+            TIMERS[tid] = t
+            save_timer(t)
+        return {"ok": True, "id": tid}
+
+    try:
+        duration = common.parse_duration(str(body.get("duration", "")))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    t["duration"] = duration
+    t["expires_at"] = common.now() + duration
+
+    if kind == "wall_group":
+        t["target_group"] = grp.getgrgid(pwd.getpwuid(uid).pw_gid).gr_name
+    elif kind == "cmd":
+        command = body.get("command")
+        shell = bool(body.get("shell", False))
+        if shell:
+            if not isinstance(command, str) or not command.strip():
+                return {"ok": False, "error": "command must be a non-empty string with --shell"}
+        else:
+            if not isinstance(command, list) or not command or not all(isinstance(a, str) for a in command):
+                return {"ok": False, "error": "command must be a non-empty argv list"}
+        t["command"] = command
+        t["shell"] = shell
+
+    with LOCK:
+        TIMERS[tid] = t
+        save_timer(t)
+    return {"ok": True, "id": tid}
+
+
+def visible_timer(t):
+    out = dict(t)
+    if t["kind"] == "stopwatch":
+        out["elapsed"] = common.now() - t["started_at"]
+    else:
+        out["remaining"] = t["expires_at"] - common.now()
+    return out
+
+
+def handle_list(uid, body):
+    want_all = bool(body.get("all", False))
+    if want_all and uid != 0:
+        return {"ok": False, "error": "only root can list all users' timers"}
+    with LOCK:
+        items = list(TIMERS.values())
+    if not want_all:
+        items = [t for t in items if t["owner_uid"] == uid]
+    return {"ok": True, "timers": [visible_timer(t) for t in items]}
+
+
+def handle_status(uid, body):
+    tid = body.get("id")
+    with LOCK:
+        t = TIMERS.get(tid)
+    if t is None:
+        return {"ok": False, "error": "no such timer"}
+    if t["owner_uid"] != uid and uid != 0:
+        return {"ok": False, "error": "not your timer"}
+    return {"ok": True, "timer": visible_timer(t)}
+
+
+def handle_delete(uid, body):
+    tid = body.get("id")
+    with LOCK:
+        t = TIMERS.get(tid)
+        if t is None:
+            return {"ok": False, "error": "no such timer"}
+        if t["owner_uid"] != uid and uid != 0:
+            return {"ok": False, "error": "not your timer"}
+        del TIMERS[tid]
+    delete_timer_file(tid)
+    return {"ok": True}
+
+
+def dispatch(uid, gid, req):
+    action = req.get("action")
+    body = req.get("body", {})
+    if action == "create":
+        return handle_create(uid, gid, body)
+    if action == "list":
+        return handle_list(uid, body)
+    if action == "status":
+        return handle_status(uid, body)
+    if action == "delete":
+        return handle_delete(uid, body)
+    if action == "ping":
+        return {"ok": True, "pong": True, "version": common.PROTOCOL_VERSION}
+    return {"ok": False, "error": f"unknown action {action!r}"}
+
+
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        try:
+            pid, uid, gid = common.get_peer_credentials(self.request)
+        except OSError as e:
+            log(f"could not get peer credentials: {e}")
+            return
+        try:
+            req = common.recv_json(self.request)
+        except common.ProtocolError as e:
+            common.send_json(self.request, {"ok": False, "error": str(e)})
+            return
+        if req is None:
+            return
+        try:
+            resp = dispatch(uid, gid, req)
+        except Exception as e:
+            log(f"error handling request from uid={uid}: {e!r}")
+            resp = {"ok": False, "error": "internal error"}
+        try:
+            common.send_json(self.request, resp)
+        except OSError:
+            pass
+
+
+class Server(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    if os.geteuid() != 0:
+        print("tooktoolongd must run as root", file=sys.stderr)
+        sys.exit(1)
+
+    ensure_dirs()
+    startup_reconcile()
+
+    sock_path = common.SOCKET_PATH
+    if os.path.exists(sock_path):
+        os.unlink(sock_path)
+
+    server = Server(sock_path, Handler)
+    os.chmod(sock_path, 0o666)  # everyone may connect; authorization is via SO_PEERCRED
+
+    stop_event = threading.Event()
+    sched_thread = threading.Thread(target=scheduler_loop, args=(stop_event,), daemon=True)
+    sched_thread.start()
+
+    def shutdown(signum, frame):
+        log(f"received signal {signum}, shutting down")
+        stop_event.set()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    log(f"tooktoolongd listening on {sock_path}, {len(TIMERS)} timer(s) loaded")
+    try:
+        server.serve_forever()
+    finally:
+        stop_event.set()
+        try:
+            os.unlink(sock_path)
+        except OSError:
+            pass
+        log("tooktoolongd stopped")
+
+
+if __name__ == "__main__":
+    main()

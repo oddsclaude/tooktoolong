@@ -1,0 +1,32 @@
+post_install() {
+    cat <<EOF
+==> tooktoolong installed.
+==> Start the daemon with:
+      systemctl enable --now TookTooLong.service
+==> Then use it as any user with:
+      ttlctl timer wall-group 5m
+      ttlctl timer cmd 5m -- notify-send done
+      ttlctl stopwatch start
+      ttlctl list
+EOF
+}
+
+post_upgrade() {
+    cat <<EOF
+==> tooktoolong upgraded.
+==> Restart the daemon to run the new version:
+      systemctl restart TookTooLong.service
+EOF
+}
+
+pre_remove() {
+    systemctl disable --now TookTooLong.service &>/dev/null || true
+}
+
+post_remove() {
+    cat <<EOF
+==> tooktoolong removed.
+==> Persisted timers/stopwatches in /var/lib/tooktoolong were left in place;
+==> remove that directory yourself if you don't want them kept.
+EOF
+}

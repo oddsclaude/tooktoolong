@@ -1,0 +1,41 @@
+# For locally-built/unpackaged installs, with tooktoolongd + ttlcommon.py
+# under /usr/local/lib/tooktoolong/ (the /usr/local prefix).
+#
+#   install -d -m 0755 /usr/local/lib/tooktoolong
+#   install -m 0755 tooktoolongd /usr/local/lib/tooktoolong/
+#   install -m 0644 ttlcommon.py /usr/local/lib/tooktoolong/
+#   install -m 0644 systemd/usr-local/TookTooLong.service /usr/local/lib/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now TookTooLong.service
+#
+# ttlctl (the user-facing client) just needs ttlcommon.py next to it on
+# disk; a common choice is to install it alongside, e.g. /usr/local/lib/tooktoolong/ttlctl,
+# with a symlink from /usr/local/bin/ttlctl.
+#
+# Note: /usr/local/lib/systemd/system is only in systemd's default unit
+# search path on some distros. If `systemctl daemon-reload` doesn't pick
+# this up, either symlink it into /etc/systemd/system/ or add
+# /usr/local/lib/systemd/system to systemd's search path.
+
+[Unit]
+Description=TookTooLong timer/wall/stopwatch daemon
+Documentation=man:wall(1)
+After=systemd-user-sessions.service local-fs.target
+Wants=systemd-user-sessions.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/tooktoolong/tooktoolongd
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=tooktoolong
+RuntimeDirectoryMode=0755
+StateDirectory=tooktoolong
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

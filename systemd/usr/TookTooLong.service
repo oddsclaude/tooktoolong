@@ -1,0 +1,36 @@
+# For distro-packaged installs, with tooktoolongd + ttlcommon.py under
+# /usr/lib/tooktoolong/ (merged-/usr systems, or a plain /usr prefix).
+#
+#   install -d -m 0755 /usr/lib/tooktoolong
+#   install -m 0755 tooktoolongd /usr/lib/tooktoolong/
+#   install -m 0644 ttlcommon.py /usr/lib/tooktoolong/
+#   install -m 0644 systemd/usr/TookTooLong.service /usr/lib/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now TookTooLong.service
+#
+# ttlctl (the user-facing client) just needs ttlcommon.py next to it on
+# disk; a common choice is to install it alongside, e.g. /usr/lib/tooktoolong/ttlctl,
+# with a symlink from /usr/bin/ttlctl.
+
+[Unit]
+Description=TookTooLong timer/wall/stopwatch daemon
+Documentation=man:wall(1)
+After=systemd-user-sessions.service local-fs.target
+Wants=systemd-user-sessions.service
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/tooktoolong/tooktoolongd
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=tooktoolong
+RuntimeDirectoryMode=0755
+StateDirectory=tooktoolong
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
